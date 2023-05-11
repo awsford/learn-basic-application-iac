@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  CloudFormation template to launch a HTTP & HTTPS web server with read/write permissions
+  to specified Amazon S3 Bucket, and SSH access from specified CIDR range. This template
+  assumes that a suitable network with public subnet already exists, and is provided via
+  CFN parameters.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: What environment is this application running in?
+    AllowedValues:
+      - dev
+      - staging
+      - test
+      - prod
+  ApplicationName:
+    Type: String
+    Default: SecureSite
+    Description: Provide a name for the application.
+  NetworkVPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: The ID of the VPC to deploy into.
+  NetworkSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: The ID of the PUBLIC subnet to deploy the instance into.
+  ApplicationInstanceAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: The Amazon Machine Image to use for this application
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  ApplicationInstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues: # edit this mapping for suitable sized instances
+      - t2.micro
+      - t3.large
+      - c5.xlarge
+    Description: The instance size to user for this application
+  ApplicationSSHCIDR:
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    Description: The permissible CIDR range for SSH access to the instance.
+    ConstraintDescription: This must be a valid CIDR range => x.x.x.x/x.
+  ApplicationSSHKeyPairName:
+    Type: String
+    Default: AdminKey
+    Description: Name of the SSH Key Pair to use for SSH access to the instance.
+  ApplicationS3BucketName:
+    Type: String
+    Default: ClientData
+    Description: The name of the S3 bucket that this application can read and write to.
+
+Resources:
+  ApplicationEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ApplicationInstanceAMI
+      InstanceType: !Ref ApplicationInstanceType
+      IamInstanceProfile: !Ref ApplicationInstanceProfile
+      KeyName: !Ref ApplicationSSHKeyPairName
+      SecurityGroupIds:
+        - !GetAtt ApplicationSecurityGroup.GroupId
+      SubnetId: !Ref NetworkSubnetId
+      UserData:
+        Fn::Base64: !Sub |
+          Content-Type: multipart/mixed; boundary="//"
+          MIME-Version: 1.0
+          
+          --//
+          Content-Type: text/cloud-config; charset="us-ascii"
+          MIME-Version: 1.0
+          Content-Transfer-Encoding: 7bit
+          Content-Disposition: attachment; filename="cloud-config.txt"
+          
+          #cloud-config
+          cloud_final_modules:
+          - [scripts-user, always]
+          
+          --//
+          Content-Type: text/x-shellscript; charset="us-ascii"
+          MIME-Version: 1.0
+          Content-Transfer-Encoding: 7bit
+          Content-Disposition: attachment; filename="userdata.txt"
+          
+          #!/bin/bash
+          yum update -y
+          
+          echo "Hello, World!" > index.html
+          nohup python -m SimpleHTTPServer 80 &
+          --//--
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-ec2-${Environment}"
+    Metadata:
+      Comment: |
+        This EC2 instance is the primary web server for this application. On
+        creation, the OS default packages are updated via `yum` and a very
+        simple HTTP server is started to demonstrate connectivity. cloud-config
+        is configured to run userdata commands for every launch of this instance.
+  
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ApplicationName}-sg-${Environment}"
+      GroupDescription: Allow HTTP and HTTPS traffic from global, SSH from specified CIDR
+      VpcId: !Ref NetworkVPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref ApplicationSSHCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-sg-${Environment}"
+    Metadata:
+      Comment: |
+        This security group is attached to the primary application web server,
+        and permits inbound global traffic on port 80 and 443. SSH access is
+        also permitted, but to a more limited CIDR range provided as a param.
+  
+  ApplicationElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref ApplicationEC2Instance
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-eip-${Environment}"
+    Metadata:
+      Comment: |
+        This Elastic IP Address allows for the primary application web server
+        to maintain a static IP address between application updates, even if 
+        the EC2 instance is terminated. This simplifies DNS configuration.
+  
+  ApplicationInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: S3BucketAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListObjectsInBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ApplicationS3BucketName}"
+              - Sid: AllObjectActions
+                Effect: Allow
+                Action:
+                  - s3:*Object
+                Resource:
+                  - !Sub "arn:aws:s3:::${ApplicationS3BucketName}/*"
+    Metadata:
+      Comment: |
+        This role allows the EC2 service to perform read and write operations
+        to the specified bucket.
+
+  ApplicationInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref ApplicationInstanceRole
+    Metadata:
+      Comment: |
+        The instance profile links the EC2 instance and the above IAM role to
+        grant the application access to the S3 service.
+
+Outputs:
+  ApplicationIPAddress:
+    Value: !Ref ApplicationElasticIP
+    Description: IP Address of the application instance.
+  
+  ApplicationURL:
+    Value: !Sub http://${ApplicationElasticIP}
+    Description: URL of the application.

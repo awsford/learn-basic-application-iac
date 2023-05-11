@@ -1,0 +1,6 @@
+{
+    "instance_type": "",
+    "ssh_cidr_range": "",
+    "key_pair_name": "",
+    "s3_bucket_name": ""
+}
